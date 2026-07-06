@@ -6,13 +6,15 @@ on:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       APP_NAME: Beacon
       SCHEME: Beacon
       BUNDLE_ID: com.shimondeitel.beacon
       TEAM_ID: W7Q885Q59C
       SIGN_IDENTITY_SHA1: 28783A84B07D8DFC5FCF311F7B4D7FB46594C728
+      APP_ID: "6787869662"
+      IAP_ID: "6787871340"
     steps:
       - uses: actions/checkout@v4
       - uses: maxim-lobanov/setup-xcode@v1
@@ -21,6 +23,126 @@ jobs:
       - run: xcodebuild -version
       - run: brew install xcodegen
       - run: xcodegen generate
+
+      - name: List available simulators
+        run: xcrun simctl list devices available | grep -i iphone
+
+      - name: Pick simulator device (id, not name, to avoid UDID-in-name bugs)
+        id: sim
+        run: |
+          LINE=$(xcrun simctl list devices available | grep -i "iPhone 17 Pro Max" | head -1)
+          if [ -z "$LINE" ]; then
+            LINE=$(xcrun simctl list devices available | grep -i "iPhone" | head -1)
+          fi
+          UDID=$(echo "$LINE" | sed -E 's/.*\(([0-9A-Fa-f-]+)\).*/\1/')
+          NAME=$(echo "$LINE" | sed -E 's/^[[:space:]]*(.*) \([0-9A-Fa-f-]+\).*/\1/')
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Selected device: $NAME ($UDID)"
+
+      - name: Boot simulator
+        run: |
+          xcrun simctl boot "${{ steps.sim.outputs.udid }}" || true
+          xcrun simctl bootstatus "${{ steps.sim.outputs.udid }}" -b
+
+      - name: Run unit + UI tests (must fail job on failure)
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project "$APP_NAME.xcodeproj" \
+            -scheme "$SCHEME" \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            -resultBundlePath "$RUNNER_TEMP/TestResults.xcresult" \
+            2>&1 | tee "$RUNNER_TEMP/test.log"
+          echo "----- TEST SUMMARY -----"
+          grep -E "Test Suite|passed|failed|TEST SUCCEEDED|TEST FAILED" "$RUNNER_TEMP/test.log" | tail -120
+
+      - name: Fail explicitly if tests did not pass
+        run: |
+          if grep -qE "\*\* TEST FAILED \*\*" "$RUNNER_TEMP/test.log"; then
+            echo "Tests failed — aborting before archive/upload."
+            exit 1
+          fi
+          if ! grep -qE "\*\* TEST SUCCEEDED \*\*" "$RUNNER_TEMP/test.log"; then
+            echo "Could not confirm TEST SUCCEEDED marker — aborting."
+            exit 1
+          fi
+          if grep -qi "no tests found\|0 tests" "$RUNNER_TEMP/test.log"; then
+            echo "Suspicious: log mentions no tests were found — aborting."
+            exit 1
+          fi
+          echo "Confirmed: ** TEST SUCCEEDED ** with real test execution."
+
+      - name: Debug build + install to simulator for screenshot capture
+        run: |
+          xcodebuild build \
+            -project "$APP_NAME.xcodeproj" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${{ steps.sim.outputs.udid }}" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO
+          APP_PATH=$(find "$RUNNER_TEMP/DerivedData" -name "$APP_NAME.app" -path "*Debug-iphonesimulator*" | head -1)
+          echo "APP_PATH=$APP_PATH"
+          xcrun simctl install "${{ steps.sim.outputs.udid }}" "$APP_PATH"
+          xcrun simctl launch "${{ steps.sim.outputs.udid }}" "$BUNDLE_ID"
+          sleep 4
+
+      - name: Capture screenshot
+        run: |
+          mkdir -p "$RUNNER_TEMP/shots"
+          xcrun simctl io "${{ steps.sim.outputs.udid }}" screenshot "$RUNNER_TEMP/shots/raw.png"
+          echo "-- raw capture --"
+          sips -g pixelWidth -g pixelHeight "$RUNNER_TEMP/shots/raw.png"
+
+      - name: Resize screenshots to required App Store dimensions and verify exactly
+        run: |
+          cp "$RUNNER_TEMP/shots/raw.png" "$RUNNER_TEMP/shots/app_6.7.png"
+          sips -z 2796 1290 "$RUNNER_TEMP/shots/app_6.7.png"
+          W=$(sips -g pixelWidth "$RUNNER_TEMP/shots/app_6.7.png" | tail -1 | awk '{print $2}')
+          H=$(sips -g pixelHeight "$RUNNER_TEMP/shots/app_6.7.png" | tail -1 | awk '{print $2}')
+          echo "app_6.7.png = ${W}x${H}"
+          if [ "$W" != "1290" ] || [ "$H" != "2796" ]; then
+            echo "app_6.7.png is NOT 1290x2796 — aborting"; exit 1
+          fi
+
+          cp "$RUNNER_TEMP/shots/raw.png" "$RUNNER_TEMP/shots/iap_review.png"
+          sips -z 2688 1242 "$RUNNER_TEMP/shots/iap_review.png"
+          W2=$(sips -g pixelWidth "$RUNNER_TEMP/shots/iap_review.png" | tail -1 | awk '{print $2}')
+          H2=$(sips -g pixelHeight "$RUNNER_TEMP/shots/iap_review.png" | tail -1 | awk '{print $2}')
+          echo "iap_review.png = ${W2}x${H2}"
+          if [ "$W2" != "1242" ] || [ "$H2" != "2688" ]; then
+            echo "iap_review.png is NOT 1242x2688 — aborting"; exit 1
+          fi
+
+      - name: Prepare ASC key
+        env:
+          ASC_KEY_BASE64: ${{ secrets.ASC_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo -n "$ASC_KEY_BASE64" | base64 --decode -o ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
+          echo "ASC_KEY_PATH=$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" >> "$GITHUB_ENV"
+
+      - name: Install python deps for ASC API scripts
+        run: pip3 install --quiet pyjwt cryptography
+
+      - name: Upload app screenshot (APP_IPHONE_67) via ASC API
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          SCREENSHOT_PATH: ${{ runner.temp }}/shots/app_6.7.png
+          DISPLAY_TYPE: APP_IPHONE_67
+        run: python3 asc_upload_screenshots.py
+
+      - name: Upload IAP review screenshot via ASC API
+        if: env.IAP_ID != ''
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          SCREENSHOT_PATH: ${{ runner.temp }}/shots/iap_review.png
+        run: python3 asc_upload_iap_screenshot.py
+
       - name: Import signing certificate
         env:
           BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
@@ -34,19 +156,14 @@ jobs:
           security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
           security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
           security set-key-partition-list -S apple-tool:,apple: -s -k "ci" "$KEYCHAIN" >/dev/null
+
       - name: Install provisioning profile
         env:
           PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
         run: |
           PP_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"; mkdir -p "$PP_DIR"
           echo -n "$PROVISIONING_PROFILE_BASE64" | base64 --decode -o "$PP_DIR/profile.mobileprovision"
-      - name: Prepare ASC key
-        env:
-          ASC_KEY_BASE64: ${{ secrets.ASC_KEY_BASE64 }}
-          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-        run: |
-          mkdir -p ~/.appstoreconnect/private_keys
-          echo -n "$ASC_KEY_BASE64" | base64 --decode -o ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8
+
       - name: Archive
         env:
           PROFILE_NAME: ${{ secrets.PROFILE_NAME }}
@@ -55,6 +172,7 @@ jobs:
             -archivePath "$RUNNER_TEMP/$APP_NAME.xcarchive" -destination 'generic/platform=iOS' \
             CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$TEAM_ID" \
             PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" CODE_SIGN_IDENTITY="$SIGN_IDENTITY_SHA1"
+
       - name: Export IPA
         env:
           PROFILE_NAME: ${{ secrets.PROFILE_NAME }}
@@ -74,6 +192,7 @@ jobs:
           PLIST
           xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/$APP_NAME.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/export.plist" -exportPath "$RUNNER_TEMP/export"
+
       - name: Upload to App Store Connect
         env:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
@@ -81,3 +200,10 @@ jobs:
         run: |
           IPA=$(ls "$RUNNER_TEMP/export/"*.ipa | head -1)
           xcrun altool --upload-app -f "$IPA" -t ios --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Upload test results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ${{ runner.temp }}/TestResults.xcresult
