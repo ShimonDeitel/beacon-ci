@@ -125,7 +125,7 @@ jobs:
           echo "ASC_KEY_PATH=$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" >> "$GITHUB_ENV"
 
       - name: Install python deps for ASC API scripts
-        run: pip3 install --quiet pyjwt cryptography
+        run: pip3 install --quiet --break-system-packages pyjwt cryptography
 
       - name: Upload app screenshot (APP_IPHONE_67) via ASC API
         env:
