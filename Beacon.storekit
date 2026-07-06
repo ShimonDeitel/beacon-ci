@@ -1,0 +1,29 @@
+{
+  "identifier" : "beacon",
+  "nonRenewingSubscriptions" : [],
+  "products" : [
+    {
+      "displayPrice" : "2.99",
+      "familyShareable" : false,
+      "internalID" : "beacon_pro_unlock",
+      "localizations" : [
+        {
+          "description" : "Unlocks unlimited items and custom reminder lead-time",
+          "displayName" : "Beacon Pro",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "beacon_pro_unlock",
+      "referenceName" : "Beacon Pro Unlock",
+      "type" : "NonConsumable"
+    }
+  ],
+  "settings" : {
+    "_askToBuyEnabled" : false
+  },
+  "subscriptionGroups" : [],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}
