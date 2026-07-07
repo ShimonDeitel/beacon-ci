@@ -49,6 +49,12 @@ def req(method, path, token, body=None):
 def main():
     token = make_jwt()
 
+    status, existing = req("GET", f"https://api.appstoreconnect.apple.com/v2/inAppPurchases/{IAP_ID}", token)
+    iap_state = existing.get("data", {}).get("attributes", {}).get("state")
+    if iap_state and iap_state != "MISSING_METADATA":
+        print(f"IAP state is already '{iap_state}' (not MISSING_METADATA) — review screenshot already set, skipping.")
+        return
+
     with open(SCREENSHOT_PATH, "rb") as f:
         content = f.read()
     file_size = len(content)
